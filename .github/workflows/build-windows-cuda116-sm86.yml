@@ -167,7 +167,7 @@ jobs:
           cmake --build build-win --config Release --parallel
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Package executable and runtime dependencies
+      - name: Package executable and runtime dependencies (fixed CRT detection)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -178,36 +178,113 @@ jobs:
 
           New-Item -ItemType Directory -Path $dist -Force | Out-Null
 
+          # The Release build has already succeeded. Copy the actual build outputs.
           foreach ($fileName in @("gpu_burn.exe", "compare.fatbin")) {
             $source = Join-Path $buildDir $fileName
-            if (-not (Test-Path $source)) { throw "Build output missing: $source" }
+            if (-not (Test-Path $source)) {
+              Write-Host "Build output directory contents:"
+              if (Test-Path $buildDir) {
+                Get-ChildItem $buildDir -Force | Format-Table Name, Length
+              }
+              throw "Build output missing: $source"
+            }
             Copy-Item $source -Destination $dist -Force
           }
 
+          # Bundle CUDA runtime DLLs, but never bundle or install the NVIDIA display driver.
           $cudaBin = Join-Path $env:CUDA_PATH "bin"
           foreach ($dll in @("cudart64_110.dll", "cublas64_11.dll", "cublasLt64_11.dll")) {
             $source = Join-Path $cudaBin $dll
-            if (-not (Test-Path $source)) { throw "Required CUDA runtime DLL missing: $source" }
+            if (-not (Test-Path $source)) {
+              throw "Required CUDA runtime DLL missing: $source"
+            }
             Copy-Item $source -Destination $dist -Force
           }
 
-          # MSVC 14.x runtime DLLs are binary-compatible across the VS 2015-2022 family.
-          # Package the current x64 VC runtime from the runner.
+          # Locate the app-local MSVC CRT files.
+          # Do not cast every directory name to [version]: this folder can also
+          # contain labels such as "v143", which are not numeric version strings.
           $programFilesX86 = [Environment]::GetFolderPath("ProgramFilesX86")
           $vswhere = Join-Path $programFilesX86 "Microsoft Visual Studio\Installer\vswhere.exe"
-          $vsPath = & $vswhere -latest -products * -property installationPath
-          if (-not $vsPath) { throw "Visual Studio installation not found." }
+          if (-not (Test-Path $vswhere)) {
+            throw "vswhere.exe not found: $vswhere"
+          }
+
+          $vsPath = (& $vswhere -latest -products * -property installationPath | Select-Object -First 1).Trim()
+          if (-not $vsPath) {
+            throw "Visual Studio installation path was not found."
+          }
+
+          $crtDir = $null
+          $crtNames = @("Microsoft.VC142.CRT", "Microsoft.VC143.CRT")
+
+          # First use the redistributable path selected by the active MSVC environment, if available.
+          if ($env:VCToolsRedistDir) {
+            Write-Host "VCToolsRedistDir=$env:VCToolsRedistDir"
+            foreach ($crtName in $crtNames) {
+              $candidate = Join-Path $env:VCToolsRedistDir "x64\$crtName"
+              if (Test-Path $candidate) {
+                $crtDir = $candidate
+                break
+              }
+            }
+          }
 
           $crtRoot = Join-Path $vsPath "VC\Redist\MSVC"
-          $crtVersion = Get-ChildItem $crtRoot -Directory |
-            Sort-Object { [version]$_.Name } -Descending |
-            Select-Object -First 1
-          if (-not $crtVersion) { throw "MSVC redistributable directory not found." }
 
-          $crtDir = Join-Path $crtVersion.FullName "x64\Microsoft.VC143.CRT"
-          if (-not (Test-Path $crtDir)) { throw "MSVC x64 CRT directory not found: $crtDir" }
-          Get-ChildItem $crtDir -Filter "*.dll" -File |
-            Copy-Item -Destination $dist -Force
+          # Fallback: consider only genuinely numeric version directories.
+          # This deliberately excludes directory names such as "v143".
+          if (-not $crtDir -and (Test-Path $crtRoot)) {
+            $numericRedistDirs = @(
+              Get-ChildItem $crtRoot -Directory |
+                Where-Object { $_.Name -match '^\d+(\.\d+){1,3}$' } |
+                Sort-Object { [version]$_.Name } -Descending
+            )
+
+            foreach ($versionDir in $numericRedistDirs) {
+              foreach ($crtName in $crtNames) {
+                $candidate = Join-Path $versionDir.FullName "x64\$crtName"
+                if (Test-Path $candidate) {
+                  $crtDir = $candidate
+                  break
+                }
+              }
+              if ($crtDir) { break }
+            }
+          }
+
+          # Last fallback: search for the x64 VC142/VC143 CRT directory directly.
+          if (-not $crtDir -and (Test-Path $crtRoot)) {
+            $crtMatch = Get-ChildItem $crtRoot -Directory -Recurse -ErrorAction SilentlyContinue |
+              Where-Object {
+                $_.Name -in $crtNames -and
+                $_.FullName -match '\\x64\\Microsoft\.VC14[23]\.CRT$'
+              } |
+              Select-Object -First 1
+
+            if ($crtMatch) {
+              $crtDir = $crtMatch.FullName
+            }
+          }
+
+          if (-not $crtDir -or -not (Test-Path $crtDir)) {
+            Write-Host "MSVC redist root: $crtRoot"
+            Write-Host "VCToolsRedistDir: $env:VCToolsRedistDir"
+            if (Test-Path $crtRoot) {
+              Write-Host "MSVC redist directory entries:"
+              Get-ChildItem $crtRoot -Force | Select-Object Name, FullName | Format-Table -AutoSize
+            }
+            throw "Could not locate an x64 Microsoft.VC142.CRT or Microsoft.VC143.CRT directory."
+          }
+
+          Write-Host "Using MSVC CRT directory: $crtDir"
+          $crtFiles = @(Get-ChildItem $crtDir -File)
+          if ($crtFiles.Count -eq 0) {
+            throw "MSVC CRT directory contains no files: $crtDir"
+          }
+
+          # Copy DLLs and their app-local manifests/catalog files, when present.
+          $crtFiles | Copy-Item -Destination $dist -Force
 
           if (Test-Path (Join-Path $root "LICENSE")) {
             Copy-Item (Join-Path $root "LICENSE") `
@@ -231,15 +308,15 @@ jobs:
           GPU-Burn A40 Windows package - CUDA 11.6.2 / SM86 / MSVC 14.29
 
           Extract this folder completely. Keep gpu_burn.exe, compare.fatbin and
-          all DLL files together.
+          all DLL/manifest files together.
 
           1. Run 01_List_GPU.bat first.
           2. If the A40 vGPU is listed as GPU 0, run 02_Test_60s.bat.
           3. Open 03_Monitor_GPU.bat in a second window to watch nvidia-smi.
 
-          This package includes CUDA 11.6 runtime DLLs and MSVC runtime DLLs.
+          This package includes CUDA 11.6 runtime DLLs and MSVC runtime files.
           It does not install or replace the NVIDIA display driver.
-          The target VM must already have a working NVIDIA Guest Driver.
+          The target Windows VM must already have a working NVIDIA Guest Driver.
 
           A40-2Q has 2 GB of assigned framebuffer memory. The 60-second test
           starts with -m 70% to limit the initial allocation. Close other
@@ -295,6 +372,8 @@ jobs:
 
           Write-Host "Package created: $zipPath"
           Write-Host "SHA256: $hash"
+          Write-Host "Package contents:"
+          Get-ChildItem $dist -File | Select-Object Name, Length | Format-Table -AutoSize
 
       - name: Upload ready-to-run package
         uses: actions/upload-artifact@v4
