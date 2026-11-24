@@ -1,3 +1,227 @@
+name: GPU-Burn Windows CUDA 11.6.2 SM86
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Windows x64 (CUDA 11.6.2 / SM86)
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout GPU-Burn source
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC x64 environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install CUDA Toolkit 11.6.2 from NVIDIA local installer (no display driver)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $installer = Join-Path $env:RUNNER_TEMP "cuda_11.6.2_511.65_windows.exe"
+          $url = "https://developer.download.nvidia.com/compute/cuda/11.6.2/local_installers/cuda_11.6.2_511.65_windows.exe"
+          $expectedMd5 = "b5ca553bcf7e702a6bc454979aa87e65"
+
+          Write-Host "Downloading NVIDIA CUDA Toolkit 11.6.2 full local installer..."
+          curl.exe --location --fail --retry 4 --retry-delay 5 --silent --show-error `
+            --output $installer $url
+          if ($LASTEXITCODE -ne 0) {
+            throw "CUDA local installer download failed: curl exit code $LASTEXITCODE"
+          }
+          if (-not (Test-Path $installer)) {
+            throw "CUDA local installer file was not created."
+          }
+
+          $actualMd5 = (Get-FileHash -Path $installer -Algorithm MD5).Hash.ToLowerInvariant()
+          Write-Host "CUDA installer MD5: $actualMd5"
+          if ($actualMd5 -ne $expectedMd5) {
+            throw "CUDA installer MD5 mismatch. Expected $expectedMd5, got $actualMd5"
+          }
+
+          # Install only Toolkit components. Deliberately omit Display.Driver,
+          # so this build job does not install/replace an NVIDIA display driver.
+          $arguments = "-s nvcc_11.6 cudart_11.6 cublas_11.6 cublas_dev_11.6 thrust_11.6"
+          Write-Host "Running CUDA installer with arguments: $arguments"
+          $process = Start-Process -FilePath $installer `
+            -ArgumentList $arguments -Wait -PassThru -NoNewWindow
+
+          Write-Host "CUDA installer exit code: $($process.ExitCode)"
+          if ($process.ExitCode -notin @(0, 3010)) {
+            throw "CUDA Toolkit installer failed with exit code $($process.ExitCode)"
+          }
+
+          $cudaRoot = Join-Path $env:ProgramFiles "NVIDIA GPU Computing Toolkit\CUDA\v11.6"
+          $nvcc = Join-Path $cudaRoot "bin\nvcc.exe"
+
+          # Allow time for the installer to finish any child setup processes.
+          $deadline = (Get-Date).AddMinutes(10)
+          while (-not (Test-Path $nvcc) -and (Get-Date) -lt $deadline) {
+            Write-Host "Waiting for nvcc.exe to appear..."
+            Start-Sleep -Seconds 10
+          }
+
+          if (-not (Test-Path $nvcc)) {
+            Write-Host "CUDA installation directory contents:"
+            if (Test-Path $cudaRoot) {
+              Get-ChildItem $cudaRoot -Force | Format-Table Name, Mode
+            } else {
+              Write-Host "Directory does not exist: $cudaRoot"
+            }
+
+            Write-Host "Recent NVIDIA installer logs:"
+            Get-ChildItem $env:TEMP -Filter "*.log" -File -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime -Descending |
+              Select-Object -First 10 FullName, Length, LastWriteTime |
+              Format-Table -AutoSize
+
+            throw "nvcc.exe was not found after CUDA Toolkit installation."
+          }
+
+          "CUDA_PATH=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$cudaRoot\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+          Write-Host "CUDA_PATH=$cudaRoot"
+          & $nvcc --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify build tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (-not $env:CUDA_PATH) {
+            throw "CUDA_PATH was not set."
+          }
+
+          Write-Host "MSVC compiler:"
+          where.exe cl
+          if ($LASTEXITCODE -ne 0) { throw "MSVC cl.exe was not found in PATH." }
+          cl 2>&1 | Select-Object -First 4
+
+          Write-Host "CMake:"
+          cmake --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          Write-Host "NVCC:"
+          & "$env:CUDA_PATH\bin\nvcc.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # CUDA 11.6 officially supports MSVC 19.3x (VS 2022 17.0).
+          # GitHub's hosted VS 2022 image can contain a newer MSVC toolset.
+          # This flag lets nvcc proceed with the runner's newer host compiler.
+          "NVCC_PREPEND_FLAGS=-allow-unsupported-compiler" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Configure GPU-Burn for A40 (SM86)
+        shell: pwsh
+        run: |
+          cmake -S win -B build-win `
+            -G "Visual Studio 17 2022" -A x64 `
+            -DCOMPUTE=86 `
+            "-DCUDAToolkit_ROOT=$env:CUDA_PATH"
+
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build Release
+        shell: pwsh
+        run: |
+          cmake --build build-win --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package executable and runtime dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $root = $env:GITHUB_WORKSPACE
+          $buildDir = Join-Path $root "build-win\Release"
+          $dist = Join-Path $root "dist\GPU_Burn_A40_Windows_CUDA116_SM86"
+
+          New-Item -ItemType Directory -Path $dist -Force | Out-Null
+
+          foreach ($fileName in @("gpu_burn.exe", "compare.fatbin")) {
+            $source = Join-Path $buildDir $fileName
+            if (-not (Test-Path $source)) {
+              throw "Build output missing: $source"
+            }
+            Copy-Item $source -Destination $dist -Force
+          }
+
+          # CUDA runtime DLLs needed by the executable.
+          $cudaBin = Join-Path $env:CUDA_PATH "bin"
+          $cudaDlls = @(
+            "cudart64_110.dll",
+            "cublas64_11.dll",
+            "cublasLt64_11.dll"
+          )
+
+          foreach ($dll in $cudaDlls) {
+            $source = Join-Path $cudaBin $dll
+            if (-not (Test-Path $source)) {
+              throw "Required CUDA runtime DLL missing: $source"
+            }
+            Copy-Item $source -Destination $dist -Force
+          }
+
+          # Bundle x64 MSVC runtime DLLs. The NVIDIA display driver is NOT bundled.
+          $programFilesX86 = [Environment]::GetFolderPath("ProgramFilesX86")
+          $vswhere = Join-Path $programFilesX86 "Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) {
+            throw "vswhere.exe not found; cannot locate the MSVC runtime."
+          }
+
+          $vsPath = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+
+          if (-not $vsPath) {
+            throw "Visual Studio C++ build tools were not found on the runner."
+          }
+
+          $crtRoot = Join-Path $vsPath "VC\Redist\MSVC"
+          $crtVersion = Get-ChildItem $crtRoot -Directory |
+            Sort-Object { [version]$_.Name } -Descending |
+            Select-Object -First 1
+
+          if (-not $crtVersion) {
+            throw "MSVC redistributable directory was not found: $crtRoot"
+          }
+
+          $crtDir = Join-Path $crtVersion.FullName "x64\Microsoft.VC143.CRT"
+          if (-not (Test-Path $crtDir)) {
+            throw "MSVC x64 runtime directory was not found: $crtDir"
+          }
+
+          Get-ChildItem $crtDir -Filter "*.dll" -File |
+            Copy-Item -Destination $dist -Force
+
+          $license = Join-Path $root "LICENSE"
+          if (Test-Path $license) {
+            Copy-Item $license -Destination (Join-Path $dist "GPU_Burn_LICENSE.txt") -Force
+          }
+
+          $commit = (git -C $root rev-parse HEAD).Trim()
+          $buildInfo = @"
+          GPU-Burn Windows x64 package
+          Source: https://github.com/wilicc/gpu-burn
+          Source commit: $commit
+          CUDA Toolkit: 11.6.2
+          CUDA architecture: SM86 (compute capability 8.6)
+          Build configuration: Release / Visual Studio 2022 / x64
+
+          The NVIDIA display driver is not included.
+          The target Windows VM must have a compatible NVIDIA Guest Driver.
+          "@
+          Set-Content -Path (Join-Path $dist "BUILD_INFO.txt") -Value $buildInfo -Encoding UTF8
+
           $readme = @'
           GPU-Burn A40 Windows package - CUDA 11.6.2 / SM86
 
