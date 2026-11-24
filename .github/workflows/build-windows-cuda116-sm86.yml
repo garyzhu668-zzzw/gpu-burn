@@ -1,0 +1,310 @@
+name: GPU-Burn Windows CUDA 11.6.2 SM86
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Windows x64 (CUDA 11.6.2 / SM86)
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout GPU-Burn source
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC x64 environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Download and install CUDA Toolkit 11.6.2 (toolkit only)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $installer = Join-Path $env:RUNNER_TEMP "cuda_11.6.2_windows_network.exe"
+          $url = "https://developer.download.nvidia.com/compute/cuda/11.6.2/network_installers/cuda_11.6.2_windows_network.exe"
+
+          Write-Host "Downloading official NVIDIA CUDA 11.6.2 network installer..."
+          curl.exe -L --fail --retry 3 --retry-delay 5 -o $installer $url
+          if ($LASTEXITCODE -ne 0) {
+            throw "CUDA network installer download failed with exit code $LASTEXITCODE"
+          }
+          if (-not (Test-Path $installer)) {
+            throw "CUDA installer was not downloaded."
+          }
+
+          # Install only compiler/runtime/library components.
+          # Display.Driver is intentionally omitted: the GitHub runner does not
+          # need an NVIDIA display driver, and the target vGPU driver is untouched.
+          Write-Host "Installing CUDA Toolkit 11.6 components..."
+          & $installer -s nvcc_11.6 cudart_11.6 cublas_11.6 cublas_dev_11.6 thrust_11.6
+          $installExitCode = $LASTEXITCODE
+          if ($installExitCode -notin @(0, 3010)) {
+            throw "CUDA Toolkit installation failed with exit code $installExitCode"
+          }
+
+          $cudaRoot = Join-Path $env:ProgramFiles "NVIDIA GPU Computing Toolkit\CUDA\v11.6"
+          $nvcc = Join-Path $cudaRoot "bin\nvcc.exe"
+          if (-not (Test-Path $nvcc)) {
+            throw "nvcc.exe was not found after CUDA installation: $nvcc"
+          }
+
+          "CUDA_PATH=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$cudaRoot\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+          Write-Host "CUDA Toolkit installed at: $cudaRoot"
+          & $nvcc --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify build tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (-not $env:CUDA_PATH) {
+            throw "CUDA_PATH was not set."
+          }
+
+          where.exe cl
+          if ($LASTEXITCODE -ne 0) { throw "MSVC cl.exe was not found in PATH." }
+
+          cmake --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          & "$env:CUDA_PATH\bin\nvcc.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Configure GPU-Burn for A40 (SM86)
+        shell: pwsh
+        run: |
+          cmake -S win -B build-win `
+            -G "Visual Studio 17 2022" -A x64 `
+            -DCOMPUTE=86 `
+            "-DCUDAToolkit_ROOT=$env:CUDA_PATH"
+
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build Release
+        shell: pwsh
+        run: |
+          cmake --build build-win --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package executable and runtime dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $root = $env:GITHUB_WORKSPACE
+          $buildDir = Join-Path $root "build-win\Release"
+          $dist = Join-Path $root "dist\GPU_Burn_A40_Windows_CUDA116_SM86"
+
+          New-Item -ItemType Directory -Path $dist -Force | Out-Null
+
+          foreach ($fileName in @("gpu_burn.exe", "compare.fatbin")) {
+            $source = Join-Path $buildDir $fileName
+            if (-not (Test-Path $source)) {
+              throw "Build output missing: $source"
+            }
+            Copy-Item $source -Destination $dist -Force
+          }
+
+          # CUDA runtime DLLs used by gpu_burn.exe.
+          $cudaBin = Join-Path $env:CUDA_PATH "bin"
+          $cudaDlls = @(
+            "cudart64_110.dll",
+            "cublas64_11.dll",
+            "cublasLt64_11.dll"
+          )
+
+          foreach ($dll in $cudaDlls) {
+            $source = Join-Path $cudaBin $dll
+            if (-not (Test-Path $source)) {
+              throw "Required CUDA runtime DLL missing: $source"
+            }
+            Copy-Item $source -Destination $dist -Force
+          }
+
+          # Bundle the x64 MSVC runtime DLLs so the test VM does not need
+          # Visual Studio installed. The NVIDIA display driver is NOT bundled.
+          $programFilesX86 = [Environment]::GetFolderPath("ProgramFilesX86")
+          $vswhere = Join-Path $programFilesX86 "Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) {
+            throw "vswhere.exe not found; cannot locate the MSVC runtime."
+          }
+
+          $vsPath = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+
+          if (-not $vsPath) {
+            throw "Visual Studio C++ build tools were not found on the runner."
+          }
+
+          $crtRoot = Join-Path $vsPath "VC\Redist\MSVC"
+          $crtVersion = Get-ChildItem $crtRoot -Directory |
+            Sort-Object { [version]$_.Name } -Descending |
+            Select-Object -First 1
+
+          if (-not $crtVersion) {
+            throw "MSVC redistributable directory was not found: $crtRoot"
+          }
+
+          $crtDir = Join-Path $crtVersion.FullName "x64\Microsoft.VC143.CRT"
+          if (-not (Test-Path $crtDir)) {
+            throw "MSVC x64 runtime directory was not found: $crtDir"
+          }
+
+          Get-ChildItem $crtDir -Filter "*.dll" -File |
+            Copy-Item -Destination $dist -Force
+
+          # Include the upstream project license.
+          $license = Join-Path $root "LICENSE"
+          if (Test-Path $license) {
+            Copy-Item $license -Destination (Join-Path $dist "GPU_Burn_LICENSE.txt") -Force
+          }
+
+          $commit = (git -C $root rev-parse HEAD).Trim()
+          $buildInfo = @"
+          GPU-Burn Windows x64 package
+          Source: https://github.com/wilicc/gpu-burn
+          Source commit: $commit
+          CUDA Toolkit: 11.6.2
+          CUDA architecture: SM86 (compute capability 8.6)
+          Build configuration: Release / Visual Studio 2022 / x64
+
+          The NVIDIA display driver is not included.
+          This package is intended for a Windows guest with a compatible NVIDIA driver.
+          "@
+          Set-Content -Path (Join-Path $dist "BUILD_INFO.txt") -Value $buildInfo -Encoding UTF8
+
+          $readme = @'
+          GPU-Burn A40 Windows package - CUDA 11.6.2 / SM86
+
+          1. Extract this folder completely.
+          2. Keep gpu_burn.exe, compare.fatbin and all DLL files together.
+          3. Run 01_List_GPU.bat first.
+          4. If the A40 vGPU is listed as GPU 0, run 02_Test_60s.bat.
+          5. Open 03_Monitor_GPU.bat in a second window to watch nvidia-smi.
+
+          This package includes CUDA 11.6 runtime DLLs and x64 MSVC runtime DLLs.
+          It does not install or replace the NVIDIA display driver.
+          The target VM must already have a working NVIDIA driver and nvidia-smi.
+
+          A40-2Q has 2 GB of assigned framebuffer memory. The 60-second test
+          starts with -m 70% to limit the initial allocation. Close other
+          GPU-accelerated applications before testing. If the program reports
+          "Low mem for result", check available GPU memory with nvidia-smi
+          before changing the allocation percentage.
+
+          Stop a running test with Ctrl+C.
+          This is a stress test. Run it only in a designated test VM and
+          preferably during a maintenance window. Do not run it on the ESXi host.
+          '@
+          Set-Content -Path (Join-Path $dist "README_CN.txt") -Value $readme -Encoding UTF8
+
+          $listBat = @'
+          @echo off
+          setlocal
+          cd /d "%~dp0"
+          set "NVSMI_DIR=%ProgramFiles%\NVIDIA Corporation\NVSMI"
+          if exist "%NVSMI_DIR%\nvidia-smi.exe" set "PATH=%NVSMI_DIR%;%PATH%"
+          echo ===== NVIDIA GPU information =====
+          where nvidia-smi
+          if errorlevel 1 (
+            echo nvidia-smi was not found. Check the NVIDIA guest driver installation.
+            pause
+            exit /b 1
+          )
+          nvidia-smi
+          echo.
+          echo ===== GPU-Burn device list =====
+          gpu_burn.exe -l
+          pause
+          '@
+          [System.IO.File]::WriteAllText(
+            (Join-Path $dist "01_List_GPU.bat"),
+            $listBat,
+            [System.Text.Encoding]::ASCII
+          )
+
+          $testBat = @'
+          @echo off
+          setlocal
+          cd /d "%~dp0"
+          set "NVSMI_DIR=%ProgramFiles%\NVIDIA Corporation\NVSMI"
+          if exist "%NVSMI_DIR%\nvidia-smi.exe" set "PATH=%NVSMI_DIR%;%PATH%"
+
+          if not exist "gpu_burn.exe" (
+            echo ERROR: gpu_burn.exe is missing.
+            pause
+            exit /b 1
+          )
+          if not exist "compare.fatbin" (
+            echo ERROR: compare.fatbin is missing. Keep it beside gpu_burn.exe.
+            pause
+            exit /b 1
+          )
+
+          echo This test runs GPU 0 for 60 seconds using 70%% of available GPU memory.
+          echo Close other GPU applications before continuing.
+          echo Press Ctrl+C to stop the test.
+          echo.
+          gpu_burn.exe -i 0 -m 70%% 60
+          set "RC=%ERRORLEVEL%"
+          echo.
+          echo GPU-Burn exit code: %RC%
+          pause
+          exit /b %RC%
+          '@
+          [System.IO.File]::WriteAllText(
+            (Join-Path $dist "02_Test_60s.bat"),
+            $testBat,
+            [System.Text.Encoding]::ASCII
+          )
+
+          $monitorBat = @'
+          @echo off
+          setlocal
+          set "NVSMI_DIR=%ProgramFiles%\NVIDIA Corporation\NVSMI"
+          if exist "%NVSMI_DIR%\nvidia-smi.exe" set "PATH=%NVSMI_DIR%;%PATH%"
+          where nvidia-smi
+          if errorlevel 1 (
+            echo nvidia-smi was not found. Check the NVIDIA guest driver installation.
+            pause
+            exit /b 1
+          )
+          nvidia-smi -l 1
+          '@
+          [System.IO.File]::WriteAllText(
+            (Join-Path $dist "03_Monitor_GPU.bat"),
+            $monitorBat,
+            [System.Text.Encoding]::ASCII
+          )
+
+          $zipPath = Join-Path $root "GPU_Burn_A40_Windows_CUDA116_SM86.zip"
+          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+          Compress-Archive -Path (Join-Path $dist "*") `
+            -DestinationPath $zipPath -CompressionLevel Optimal
+
+          $hash = (Get-FileHash $zipPath -Algorithm SHA256).Hash
+          Set-Content -Path "$zipPath.sha256.txt" `
+            -Value "$hash  GPU_Burn_A40_Windows_CUDA116_SM86.zip" -Encoding ASCII
+
+          Write-Host "Package created: $zipPath"
+          Write-Host "SHA256: $hash"
+
+      - name: Upload ready-to-run package
+        uses: actions/upload-artifact@v4
+        with:
+          name: GPU_Burn_A40_Windows_CUDA116_SM86
+          path: |
+            GPU_Burn_A40_Windows_CUDA116_SM86.zip
+            GPU_Burn_A40_Windows_CUDA116_SM86.zip.sha256.txt
+          if-no-files-found: error
+          retention-days: 14
